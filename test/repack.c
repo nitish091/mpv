@@ -24,6 +24,7 @@ struct entry {
 
 #define P8(...) (const uint8_t[]){__VA_ARGS__}
 #define P16(...) (const uint16_t[]){__VA_ARGS__}
+#define F32(...) (const float[]){__VA_ARGS__}
 
 // Warning: only entries that match existing conversions are tested.
 static const struct entry repack_tests[] = {
@@ -72,6 +73,23 @@ static const struct entry repack_tests[] = {
                                      P16(0x4a4b)},
            -AV_PIX_FMT_YUV422P16,   {P16(0x1b1a, 0x2b2a), P16(0x3b3a),
                                      P16(0x4b4a)}},
+    {1, 1, IMGFMT_RGBA,             {P8(0, 255, 0, 255)},
+           -AV_PIX_FMT_GBRAPF32,    {F32(1), F32(0), F32(0), F32(1)},
+        .flags = REPACK_CREATE_PLANAR_F32},
+    {1, 1, IMGFMT_RGBA64,           {P16(0, 0xFFFF, 0, 0xFFFF)},
+           -AV_PIX_FMT_GBRAPF32,    {F32(1), F32(0), F32(0), F32(1)},
+           .flags = REPACK_CREATE_PLANAR_F32},
+    // Assumes full range conversion.
+    {2, 1, -AV_PIX_FMT_YUVA444P,    {P8(0, 255), P8(255, 0),
+                                     P8(0, 255), P8(255, 0)},
+           IMGFMT_444APF,           {F32(0, 1), F32(0.5, -0.5),
+                                     F32(-0.5, 0.5), F32(1, 0)},
+           .flags = REPACK_CREATE_PLANAR_F32},
+    {2, 2, -AV_PIX_FMT_YUVA420P,    {P8(0, 0, 0, 0), P8(255), P8(0),
+                                     P8(254, 253, 255, 0)},
+           IMGFMT_420APF,           {F32(0, 0, 0, 0), F32(0.5), F32(-0.5),
+                                     F32(254*(float)(1/255.0), 253*(float)(1/255.0), 1, 0)},
+           .flags = REPACK_CREATE_PLANAR_F32},
 };
 
 static bool is_true_planar(int imgfmt)
@@ -115,14 +133,14 @@ static int try_repack(struct test_ctx *ctx, FILE *f, int imgfmt, int flags,
 
     // Skip the identity ones because they're uninteresting, and add too much
     // noise. But still make sure they behave as expected.
-    if (is_true_planar(imgfmt)) {
+    if (a == imgfmt && b == imgfmt) {
+        assert(is_true_planar(imgfmt));
         // (note that we require alpha-enabled zimg)
         assert(mp_zimg_supports_in_format(imgfmt));
         assert(un && pa);
-        assert(a == imgfmt && b == imgfmt);
         talloc_free(pa);
         talloc_free(un);
-        return 0;
+        return b;
     }
 
     struct mp_repack *rp = pa ? pa : un;
@@ -144,6 +162,8 @@ static int try_repack(struct test_ctx *ctx, FILE *f, int imgfmt, int flags,
 
     fprintf(f, " a=%d:%d", mp_repack_get_align_x(rp), mp_repack_get_align_y(rp));
 
+    if (flags & REPACK_CREATE_PLANAR_F32)
+        fprintf(f, " [planar-f32]");
     if (flags & REPACK_CREATE_ROUND_DOWN)
         fprintf(f, " [round-down]");
     if (flags & REPACK_CREATE_EXPAND_8BIT)
@@ -171,6 +191,9 @@ static int try_repack(struct test_ctx *ctx, FILE *f, int imgfmt, int flags,
         int sx = 4 * ax, sy = 3 * ay, dx = 3 * ax, dy = 2 * ay;
 
         assert(ia && ib);
+
+        mp_image_params_guess_csp(&ia->params);
+        mp_image_params_guess_csp(&ib->params);
 
         for (int pack = 0; pack < 2; pack++) {
             struct mp_repack *repacker = pack ? pa : un;
@@ -235,6 +258,7 @@ static void run(struct test_ctx *ctx)
         int other = try_repack(ctx, f, imgfmt, 0, 0);
         try_repack(ctx, f, imgfmt, REPACK_CREATE_ROUND_DOWN, other);
         try_repack(ctx, f, imgfmt, REPACK_CREATE_EXPAND_8BIT, other);
+        try_repack(ctx, f, imgfmt, REPACK_CREATE_PLANAR_F32, other);
     }
 
     fclose(f);

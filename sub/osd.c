@@ -136,6 +136,7 @@ struct osd_state *osd_create(struct mpv_global *global)
             .type = n,
             .text = talloc_strdup(obj, ""),
             .progbar_state = {.type = -1},
+            .vo_change_id = 1,
         };
         osd->objs[n] = obj;
     }
@@ -414,8 +415,12 @@ void osd_draw_on_image_p(struct osd_state *osd, struct mp_osd_res res,
     // Need to lock for the dumb osd->draw_cache thing.
     pthread_mutex_lock(&osd->lock);
 
+    stats_time_start(osd->stats, "draw-bmp");
+
     mp_draw_sub_bitmaps(&osd->draw_cache, dest, list);
     talloc_steal(osd, osd->draw_cache);
+
+    stats_time_end(osd->stats, "draw-bmp");
 
     pthread_mutex_unlock(&osd->lock);
 

@@ -73,10 +73,12 @@ struct sub_bitmaps {
     // box. (The origin of the box is at (0,0).)
     int packed_w, packed_h;
 
-    int change_id;  // Incremented on each change
+    int change_id;  // Incremented on each change (0 is never used)
 };
 
 struct sub_bitmap_list {
+    // Sorted by sub_bitmaps.render_index. Unused parts are not in the array,
+    // and you cannot index items[] with render_index.
     struct sub_bitmaps **items;
     int num_items;
 };

@@ -21,12 +21,11 @@
 #include <math.h>
 #include <inttypes.h>
 
-#include <libswscale/swscale.h>
-
 #include "common/common.h"
 #include "draw_bmp.h"
 #include "img_convert.h"
 #include "video/mp_image.h"
+#include "video/repack.h"
 #include "video/sws_utils.h"
 #include "video/img_format.h"
 #include "video/csputils.h"
@@ -36,517 +35,385 @@ const bool mp_draw_sub_formats[SUBBITMAP_COUNT] = {
     [SUBBITMAP_RGBA] = true,
 };
 
-struct sub_cache {
-    struct mp_image *i, *a;
-};
-
 struct part {
     int change_id;
-    int imgfmt;
-    enum mp_csp colorspace;
-    enum mp_csp_levels levels;
+    // Sub-bitmaps scaled to final sizes.
     int num_imgs;
-    struct sub_cache *imgs;
+    struct mp_image **imgs;
+};
+
+// Must be powers of 2.
+#define TILE_W 256
+#define TILE_H 64
+
+struct extent {
+    uint16_t x0, x1;
+};
+
+struct tile {
+    // X range of non-transparent pixels for each line in this tile.
+    struct extent exts[TILE_H];
+    bool any_pixels;
 };
 
 struct mp_draw_sub_cache
 {
-    struct part *parts[MAX_OSD_PARTS];
-    struct mp_image *upsample_img;
-    struct mp_image upsample_temp;
+    // Possibly cached parts. Also implies what's in the video_overlay.
+    struct part parts[MAX_OSD_PARTS];
+
+    struct mp_image_params params;  // target image params
+
+    int align_x, align_y;           // alignment for all video pixels
+
+    struct mp_image *rgba_overlay;  // all OSD in RGBA
+    struct mp_image *video_overlay; // rgba_overlay converted to video colorspace
+
+    unsigned t_w, t_h;              // size in tiles (bottom/right pixels cut off)
+    struct tile *tiles;             // tiles[y_tile * t_w + x_tile]
+
+    struct mp_sws_context *rgba_to_overlay; // scaler for rgba -> video csp.
+
+    struct mp_repack *overlay_to_f32; // convert video_overlay to float
+    struct mp_image *overlay_tmp;   // slice in float32
+
+    struct mp_repack *video_to_f32; // convert video to float
+    struct mp_repack *video_from_f32; // convert float back to video
+    struct mp_image *video_tmp;     // slice in float32
+
+    // TODO: add a gray scaler to do the cursed alpha->chroma down sampling
 };
 
-
-static struct part *get_cache(struct mp_draw_sub_cache *cache,
-                              struct sub_bitmaps *sbs, struct mp_image *format);
-static bool get_sub_area(struct mp_rect bb, struct mp_image *temp,
-                         struct sub_bitmap *sb, struct mp_image *out_area,
-                         int *out_src_x, int *out_src_y);
-
-#define CONDITIONAL 1
-
-#define BLEND_CONST_ALPHA(TYPE)                                                 \
-    TYPE *dst_r = dst_rp;                                                       \
-    for (int x = 0; x < w; x++) {                                               \
-        uint32_t srcap = srca_r[x];                                             \
-        if (CONDITIONAL && !srcap) continue;                                    \
-        srcap *= srcamul; /* now 0..65025 */                                    \
-        dst_r[x] = (srcp * srcap + dst_r[x] * (65025 - srcap) + 32512) / 65025; \
-    }
-
-// dst = srcp * (srca * srcamul) + dst * (1 - (srca * srcamul))
-static void blend_const_alpha(void *dst, int dst_stride, int srcp,
-                              uint8_t *srca, int srca_stride, uint8_t srcamul,
-                              int w, int h, int bytes)
+static void blend_slice(struct mp_draw_sub_cache *cache, int rgb_y)
 {
-    if (!srcamul)
-        return;
-    for (int y = 0; y < h; y++) {
-        void *dst_rp = (uint8_t *)dst + dst_stride * y;
-        uint8_t *srca_r = srca + srca_stride * y;
-        if (bytes == 2) {
-            BLEND_CONST_ALPHA(uint16_t)
-        } else if (bytes == 1) {
-            BLEND_CONST_ALPHA(uint8_t)
-        }
-    }
-}
+    struct mp_image *ov = cache->overlay_tmp;
+    struct mp_image *vid = cache->video_tmp;
 
-#define BLEND_SRC_ALPHA(TYPE)                                                   \
-    TYPE *dst_r = dst_rp, *src_r = src_rp;                                      \
-    for (int x = 0; x < w; x++) {                                               \
-        uint32_t srcap = srca_r[x];                                             \
-        if (CONDITIONAL && !srcap) continue;                                    \
-        dst_r[x] = (src_r[x] * srcap + dst_r[x] * (255 - srcap) + 127) / 255;   \
-    }
+    ptrdiff_t astride = ov->stride[ov->num_planes - 1] / 4; // don't do this at home
 
-// dst = src * srca + dst * (1 - srca)
-static void blend_src_alpha(void *dst, int dst_stride, void *src,
-                            int src_stride, uint8_t *srca, int srca_stride,
-                            int w, int h, int bytes)
-{
-    for (int y = 0; y < h; y++) {
-        void *dst_rp = (uint8_t *)dst + dst_stride * y;
-        void *src_rp = (uint8_t *)src + src_stride * y;
-        uint8_t *srca_r = srca + srca_stride * y;
-        if (bytes == 2) {
-            BLEND_SRC_ALPHA(uint16_t)
-        } else if (bytes == 1) {
-            BLEND_SRC_ALPHA(uint8_t)
-        }
-    }
-}
+    uint32_t *rgba = mp_image_pixel_ptr(cache->rgba_overlay, 0, 0, rgb_y);
 
-#define BLEND_SRC_DST_MUL(TYPE, MAX)                                            \
-    TYPE *dst_r = dst_rp;                                                       \
-    for (int x = 0; x < w; x++) {                                               \
-        uint16_t srcp = src_r[x] * srcmul; /* now 0..65025 */                   \
-        dst_r[x] = (srcp * (MAX) + dst_r[x] * (65025 - srcp) + 32512) / 65025;  \
-    }
+    for (int p = 0; p < vid->num_planes; p++) {
+        int xs = vid->fmt.xs[p];
+        int ys = vid->fmt.ys[p];
+        int h = (1 << vid->fmt.chroma_ys) - (1 << ys) + 1;
+        int cw = mp_chroma_div_up(vid->w, xs);
+        for (int y = 0; y < h; y++) {
+            float *ov_ptr = mp_image_pixel_ptr(ov, p, 0, y);
+            float *a_ptr = mp_image_pixel_ptr(ov, ov->num_planes - 1, 0, y);
+            float *vid_ptr = mp_image_pixel_ptr(vid, p, 0, y);
 
-// dst = src * srcmul + dst * (1 - src * srcmul)
-static void blend_src_dst_mul(void *dst, int dst_stride,
-                              uint8_t *src, int src_stride, uint8_t srcmul,
-                              int w, int h, int dst_bytes)
-{
-    for (int y = 0; y < h; y++) {
-        void *dst_rp = (uint8_t *)dst + dst_stride * y;
-        uint8_t *src_r = (uint8_t *)src + src_stride * y;
-        if (dst_bytes == 2) {
-            BLEND_SRC_DST_MUL(uint16_t, 65025)
-        } else if (dst_bytes == 1) {
-            BLEND_SRC_DST_MUL(uint8_t, 255)
-        }
-    }
-}
+            for (int x = 0; x < cw; x++) {
+                // hurrrrrrrrrrrr
+                float alpha = 0;
+                for (int ax = 0; ax < (1 << xs); ax++) {
+                    for (int ay = 0; ay < (1 << ys); ay++) {
+                        alpha += a_ptr[(x << xs) + ax + astride * ay];
+                    }
+                }
+                alpha /= (1 << xs) * (1 << ys);
 
-static void unpremultiply_and_split_BGR32(struct mp_image *img,
-                                          struct mp_image *alpha)
-{
-    for (int y = 0; y < img->h; ++y) {
-        uint32_t *irow = (uint32_t *) &img->planes[0][img->stride[0] * y];
-        uint8_t *arow = &alpha->planes[0][alpha->stride[0] * y];
-        for (int x = 0; x < img->w; ++x) {
-            uint32_t pval = irow[x];
-            uint32_t aval = (pval >> 24);
-            uint32_t rval = (pval >> 16) & 0xFF;
-            uint32_t gval = (pval >> 8) & 0xFF;
-            uint32_t bval = pval & 0xFF;
-            // multiplied = separate * alpha / 255
-            // separate = rint(multiplied * 255 / alpha)
-            //          = floor(multiplied * 255 / alpha + 0.5)
-            //          = floor((multiplied * 255 + 0.5 * alpha) / alpha)
-            //          = floor((multiplied * 255 + floor(0.5 * alpha)) / alpha)
-            int div = (int) aval;
-            int add = div / 2;
-            if (aval) {
-                rval = MPMIN(255, (rval * 255 + add) / div);
-                gval = MPMIN(255, (gval * 255 + add) / div);
-                bval = MPMIN(255, (bval * 255 + add) / div);
-                irow[x] = bval + (gval << 8) + (rval << 16) + (aval << 24);
+                vid_ptr[x] = ov_ptr[x] + (1 - alpha) * vid_ptr[x];
             }
-            arow[x] = aval;
         }
     }
 }
 
-// dst_format merely contains the target colorspace/format information
-static void scale_sb_rgba(struct sub_bitmap *sb, const struct mp_image *dst_format,
-                          struct mp_image **out_sbi, struct mp_image **out_sba)
+static void blend_overlay_with_video(struct mp_draw_sub_cache *cache,
+                                     struct mp_image *dst)
 {
-    struct mp_image sbisrc = {0};
-    mp_image_setfmt(&sbisrc, IMGFMT_BGR32);
-    mp_image_set_size(&sbisrc, sb->w, sb->h);
-    sbisrc.planes[0] = sb->bitmap;
-    sbisrc.stride[0] = sb->stride;
-    struct mp_image *sbisrc2 = mp_image_alloc(IMGFMT_BGR32, sb->dw, sb->dh);
-    struct mp_image *sba = mp_image_alloc(IMGFMT_Y8, sb->dw, sb->dh);
-    struct mp_image *sbi = mp_image_alloc(dst_format->imgfmt, sb->dw, sb->dh);
-    if (!sbisrc2 || !sba || !sbi) {
-        talloc_free(sbisrc2);
-        talloc_free(sba);
-        talloc_free(sbi);
-        return;
-    }
+    if (!repack_config_buffers(cache->video_to_f32,
+                               0, cache->video_tmp, 0, dst, NULL))
+        printf("fuck! 1\n");
+    if (!repack_config_buffers(cache->video_from_f32,
+                               0, dst, 0, cache->video_tmp, NULL))
+        printf("fuck! 2\n");
 
-    mp_image_swscale(sbisrc2, &sbisrc, SWS_BILINEAR);
-    unpremultiply_and_split_BGR32(sbisrc2, sba);
+    // TODO: use extents to reduce blending
 
-    sbi->params.color = dst_format->params.color;
-    mp_image_swscale(sbi, sbisrc2, SWS_BILINEAR);
+    for (int y = 0; y < dst->h; y += cache->align_y) {
+        repack_line(cache->overlay_to_f32, 0, 0, 0, y, dst->w);
+        repack_line(cache->video_to_f32, 0, 0, 0, y, dst->w);
 
-    talloc_free(sbisrc2);
+        blend_slice(cache, y);
 
-    *out_sbi = sbi;
-    *out_sba = sba;
-}
-
-static void draw_rgba(struct mp_draw_sub_cache *cache, struct mp_rect bb,
-                      struct mp_image *temp, int bits,
-                      struct sub_bitmaps *sbs)
-{
-    struct part *part = get_cache(cache, sbs, temp);
-    assert(part);
-
-    for (int i = 0; i < sbs->num_parts; ++i) {
-        struct sub_bitmap *sb = &sbs->parts[i];
-
-        if (sb->w < 1 || sb->h < 1)
-            continue;
-
-        struct mp_image dst;
-        int src_x, src_y;
-        if (!get_sub_area(bb, temp, sb, &dst, &src_x, &src_y))
-            continue;
-
-        struct mp_image *sbi = part->imgs[i].i;
-        struct mp_image *sba = part->imgs[i].a;
-
-        if (!(sbi && sba))
-            scale_sb_rgba(sb, temp, &sbi, &sba);
-        // on OOM, skip drawing
-        if (!(sbi && sba))
-            continue;
-
-        int bytes = (bits + 7) / 8;
-        uint8_t *alpha_p = sba->planes[0] + src_y * sba->stride[0] + src_x;
-        for (int p = 0; p < (temp->num_planes > 2 ? 3 : 1); p++) {
-            void *src = sbi->planes[p] + src_y * sbi->stride[p] + src_x * bytes;
-            blend_src_alpha(dst.planes[p], dst.stride[p], src, sbi->stride[p],
-                            alpha_p, sba->stride[0], dst.w, dst.h, bytes);
-        }
-        if (temp->num_planes >= 4) {
-            blend_src_dst_mul(dst.planes[3], dst.stride[3], alpha_p,
-                              sba->stride[0], 255, dst.w, dst.h, bytes);
-        }
-
-        part->imgs[i].i = talloc_steal(part, sbi);
-        part->imgs[i].a = talloc_steal(part, sba);
+        repack_line(cache->video_from_f32, 0, y, 0, 0, dst->w);
     }
 }
 
-static void draw_ass(struct mp_draw_sub_cache *cache, struct mp_rect bb,
-                     struct mp_image *temp, int bits, struct sub_bitmaps *sbs)
+static void convert_to_video_overlay(struct mp_draw_sub_cache *cache)
 {
-    struct mp_csp_params cspar = MP_CSP_PARAMS_DEFAULTS;
-    mp_csp_set_image_params(&cspar, &temp->params);
-    cspar.levels_out = MP_CSP_LEVELS_PC; // RGB (libass.color)
-    cspar.input_bits = bits;
-    cspar.texture_bits = (bits + 7) / 8 * 8;
+    // TODO: use tile shit to avoid converting some parts of the overlay
+    if (mp_sws_scale(cache->rgba_to_overlay, cache->video_overlay,
+                     cache->rgba_overlay) < 0)
+        printf("eh what\n");
+}
 
-    struct mp_cmat yuv2rgb, rgb2yuv;
-    bool need_conv = temp->fmt.flags & MP_IMGFLAG_YUV;
-    if (need_conv) {
-        mp_get_csp_matrix(&cspar, &yuv2rgb);
-        mp_invert_cmat(&rgb2yuv, &yuv2rgb);
-    }
+static void draw_ass_rgba(unsigned char *src, int src_w, int src_h,
+                          int src_stride, unsigned char *dst, size_t dst_stride,
+                          int dst_x, int dst_y, uint32_t color)
+{
+    const unsigned int r = (color >> 24) & 0xff;
+    const unsigned int g = (color >> 16) & 0xff;
+    const unsigned int b = (color >>  8) & 0xff;
+    const unsigned int a = 0xff - (color & 0xff);
 
-    for (int i = 0; i < sbs->num_parts; ++i) {
-        struct sub_bitmap *sb = &sbs->parts[i];
+    dst += dst_y * dst_stride + dst_x * 4;
 
-        struct mp_image dst;
-        int src_x, src_y;
-        if (!get_sub_area(bb, temp, sb, &dst, &src_x, &src_y))
-            continue;
-
-        int r = (sb->libass.color >> 24) & 0xFF;
-        int g = (sb->libass.color >> 16) & 0xFF;
-        int b = (sb->libass.color >> 8) & 0xFF;
-        int a = 255 - (sb->libass.color & 0xFF);
-        int color_yuv[3];
-        if (need_conv) {
-            int rgb[3] = {r, g, b};
-            mp_map_fixp_color(&rgb2yuv, 8, rgb, cspar.texture_bits, color_yuv);
-        } else {
-            const int shift = (bits > 8) ? bits - 8 : 0;
-            color_yuv[0] = g << shift;
-            color_yuv[1] = b << shift;
-            color_yuv[2] = r << shift;
-        }
-
-        int bytes = (bits + 7) / 8;
-        uint8_t *alpha_p = (uint8_t *)sb->bitmap + src_y * sb->stride + src_x;
-        for (int p = 0; p < (temp->num_planes > 2 ? 3 : 1); p++) {
-            blend_const_alpha(dst.planes[p], dst.stride[p], color_yuv[p],
-                              alpha_p, sb->stride, a, dst.w, dst.h, bytes);
-        }
-        if (temp->num_planes >= 4) {
-            blend_src_dst_mul(dst.planes[3], dst.stride[3], alpha_p,
-                              sb->stride, a, dst.w, dst.h, bytes);
+    for (int y = 0; y < src_h; y++, dst += dst_stride, src += src_stride) {
+        uint32_t *dstrow = (uint32_t *) dst;
+        for (int x = 0; x < src_w; x++) {
+            const unsigned int v = src[x];
+            int rr = (r * a * v);
+            int gg = (g * a * v);
+            int bb = (b * a * v);
+            int aa =      a * v;
+            uint32_t dstpix = dstrow[x];
+            unsigned int dstb =  dstpix        & 0xFF;
+            unsigned int dstg = (dstpix >>  8) & 0xFF;
+            unsigned int dstr = (dstpix >> 16) & 0xFF;
+            unsigned int dsta = (dstpix >> 24) & 0xFF;
+            dstb = (bb       + dstb * (255 * 255 - aa)) / (255 * 255);
+            dstg = (gg       + dstg * (255 * 255 - aa)) / (255 * 255);
+            dstr = (rr       + dstr * (255 * 255 - aa)) / (255 * 255);
+            dsta = (aa * 255 + dsta * (255 * 255 - aa)) / (255 * 255);
+            dstrow[x] = dstb | (dstg << 8) | (dstr << 16) | (dsta << 24);
         }
     }
 }
 
-static void get_swscale_alignment(const struct mp_image *img, int *out_xstep,
-                                  int *out_ystep)
+static void render_ass(struct mp_draw_sub_cache *cache, struct sub_bitmaps *sb)
 {
-    int sx = (1 << img->fmt.chroma_xs);
-    int sy = (1 << img->fmt.chroma_ys);
+    assert(sb->format == SUBBITMAP_LIBASS);
 
-    for (int p = 0; p < img->num_planes; ++p) {
-        int bits = img->fmt.bpp[p];
-        // the * 2 fixes problems with writing past the destination width
-        while (((sx >> img->fmt.chroma_xs) * bits) % (SWS_MIN_BYTE_ALIGN * 8 * 2))
-            sx *= 2;
+    // TODO: write extents
+
+    for (int i = 0; i < sb->num_parts; i++) {
+        struct sub_bitmap *s = &sb->parts[i];
+
+        draw_ass_rgba(s->bitmap, s->w, s->h, s->stride,
+                      cache->rgba_overlay->planes[0],
+                      cache->rgba_overlay->stride[0],
+                      s->x, s->y, s->libass.color);
     }
-
-    *out_xstep = sx;
-    *out_ystep = sy;
 }
 
-static void align_bbox(int xstep, int ystep, struct mp_rect *rc)
+static void render_sb(struct mp_draw_sub_cache *cache, struct sub_bitmaps *sb)
 {
-    rc->x0 = rc->x0 & ~(xstep - 1);
-    rc->y0 = rc->y0 & ~(ystep - 1);
-    rc->x1 = FFALIGN(rc->x1, xstep);
-    rc->y1 = FFALIGN(rc->y1, ystep);
-}
+    struct part *part = &cache->parts[sb->render_index];
 
-// Post condition, if true returned: rc is inside img
-static bool align_bbox_for_swscale(struct mp_image *img, struct mp_rect *rc)
-{
-    struct mp_rect img_rect = {0, 0, img->w, img->h};
-    // Get rid of negative coordinates
-    if (!mp_rect_intersection(rc, &img_rect))
-        return false;
-    int xstep, ystep;
-    get_swscale_alignment(img, &xstep, &ystep);
-    align_bbox(xstep, ystep, rc);
-    return mp_rect_intersection(rc, &img_rect);
-}
-
-// Try to find best/closest YUV 444 format (or similar) for imgfmt
-static void get_closest_y444_format(int imgfmt, int *out_format, int *out_bits)
-{
-    struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(imgfmt);
-    int planes = desc.flags & MP_IMGFLAG_ALPHA ? 4 : 3;
-    if (desc.flags & MP_IMGFLAG_RGB) {
-        // For RGB try to match the amount of bits exactly (but no less than 8, or larger than 16)
-        int bits = (desc.component_bits > 8) ? desc.component_bits : 8;
-        if (bits > 16)
-            bits = 16;
-        *out_format = mp_imgfmt_find(0, 0, planes, bits, MP_IMGFLAG_RGB_P);
-        if (!mp_sws_supported_format(*out_format))
-            *out_format = mp_imgfmt_find(0, 0, planes, 8, MP_IMGFLAG_RGB_P);
-    } else if (desc.flags & MP_IMGFLAG_YUV_P) {
-        const int bits = (desc.component_bits > 8) ? 16 : 8;
-        *out_format = mp_imgfmt_find(0, 0, planes, bits, MP_IMGFLAG_YUV_P);
+    if (sb->format == SUBBITMAP_LIBASS) {
+        render_ass(cache, sb);
     } else {
-        *out_format = 0;
-    }
-    if (!mp_sws_supported_format(*out_format))
-        *out_format = IMGFMT_444P; // generic fallback
-    *out_bits = mp_imgfmt_get_desc(*out_format).component_bits;
-}
-
-static struct part *get_cache(struct mp_draw_sub_cache *cache,
-                              struct sub_bitmaps *sbs, struct mp_image *format)
-{
-    struct part *part = NULL;
-
-    bool use_cache = sbs->format == SUBBITMAP_RGBA;
-    if (use_cache) {
-        part = cache->parts[sbs->render_index];
-        if (part) {
-            if (part->change_id != sbs->change_id
-                || part->imgfmt != format->imgfmt
-                || part->colorspace != format->params.color.space
-                || part->levels != format->params.color.levels)
-            {
-                talloc_free(part);
-                part = NULL;
-            }
-        }
-        if (!part) {
-            part = talloc(cache, struct part);
-            *part = (struct part) {
-                .change_id = sbs->change_id,
-                .num_imgs = sbs->num_parts,
-                .imgfmt = format->imgfmt,
-                .levels = format->params.color.levels,
-                .colorspace = format->params.color.space,
-            };
-            part->imgs = talloc_zero_array(part, struct sub_cache,
-                                           part->num_imgs);
-        }
-        assert(part->num_imgs == sbs->num_parts);
-        cache->parts[sbs->render_index] = part;
+        printf("TODO: rgba sub-bitmaps unimplemented\n");
     }
 
-    return part;
+    part->change_id = sb->change_id;
 }
 
-// Return area of intersection between target and sub-bitmap as cropped image
-static bool get_sub_area(struct mp_rect bb, struct mp_image *temp,
-                         struct sub_bitmap *sb, struct mp_image *out_area,
-                         int *out_src_x, int *out_src_y)
+static void clear_rgba_overlay(struct mp_draw_sub_cache *cache)
 {
-    // coordinates are relative to the bbox
-    struct mp_rect dst = {sb->x - bb.x0, sb->y - bb.y0};
-    dst.x1 = dst.x0 + sb->dw;
-    dst.y1 = dst.y0 + sb->dh;
-    if (!mp_rect_intersection(&dst, &(struct mp_rect){0, 0, temp->w, temp->h}))
+    // TODO: use extents crap to clear only uncleared areas?
+
+    assert(cache->rgba_overlay->imgfmt == IMGFMT_BGR32);
+    for (int y = 0; y < cache->rgba_overlay->h; y++) {
+        memset(mp_image_pixel_ptr(cache->rgba_overlay, 0, 0, y), 0,
+               cache->rgba_overlay->w * 4);
+    }
+}
+
+static bool reinit(struct mp_draw_sub_cache *cache, struct mp_image_params *params)
+{
+    talloc_free_children(cache);
+    *cache = (struct mp_draw_sub_cache){.params = *params};
+
+    int rflags = REPACK_CREATE_EXPAND_8BIT | REPACK_CREATE_PLANAR_F32;
+
+    cache->video_to_f32 = mp_repack_create_planar(params->imgfmt, false, rflags);
+    talloc_steal(cache, cache->video_to_f32);
+    if (!cache->video_to_f32)
         return false;
 
-    *out_src_x = (dst.x0 - sb->x) + bb.x0;
-    *out_src_y = (dst.y0 - sb->y) + bb.y0;
-    *out_area = *temp;
-    mp_image_crop_rc(out_area, dst);
+    int vid_f32_fmt = mp_repack_get_format_dst(cache->video_to_f32);
+
+    cache->video_from_f32 = mp_repack_create_planar(params->imgfmt, true, rflags);
+    talloc_steal(cache, cache->video_from_f32);
+    if (!cache->video_from_f32)
+        return false;
+
+    assert(mp_repack_get_format_dst(cache->video_to_f32) ==
+           mp_repack_get_format_src(cache->video_from_f32));
+
+    // Find a reasonable intermediate format for video_overlay. Requirements:
+    //  - same subsampling
+    //  - has alpha
+    //  - uses video colorspace
+    //  - REPACK_CREATE_PLANAR_F32 support
+    //  - converted float values for video and overlay use same value ranges
+    //  - probably not using float (vaguely wastes memory)
+    struct mp_regular_imgfmt vfdesc = {0};
+    mp_get_regular_imgfmt(&vfdesc, mp_repack_get_format_dst(cache->video_to_f32));
+    assert(vfdesc.component_type == MP_COMPONENT_TYPE_FLOAT);
+    struct mp_regular_imgfmt odesc = vfdesc;
+
+    // Try to use video component type to reduce problems with value ranges.
+    // The low bit depth ones typically don't have alpha variants either.
+    struct mp_regular_imgfmt vdesc = {0};
+    int vdepth = 0;
+    if (mp_get_regular_imgfmt(&vdesc, params->imgfmt))
+        vdepth = vdesc.component_size * 8 + MPMIN(vdesc.component_pad, 0);
+    if (vdepth >= 8) {
+        odesc.component_type = vdesc.component_type;
+        odesc.component_size = vdesc.component_size;
+        odesc.component_pad = MPMIN(vdesc.component_pad, 0);
+    } else {
+        odesc.component_type = MP_COMPONENT_TYPE_UINT;
+        odesc.component_size = 1;
+        odesc.component_pad = 0;
+    }
+
+    // Ensure there's alpha.
+    if (odesc.planes[odesc.num_planes - 1].components[0] != 4) {
+        if (odesc.num_planes >= 4)
+            return false; // wat
+        odesc.planes[odesc.num_planes++] =
+            (struct mp_regular_imgfmt_plane){1, {4}};
+    }
+
+    int overlay_fmt = mp_find_regular_imgfmt(&odesc);
+    if (!overlay_fmt)
+        return false;
+
+    cache->overlay_to_f32 = mp_repack_create_planar(overlay_fmt, false, rflags);
+    talloc_steal(cache, cache->overlay_to_f32);
+    if (!cache->overlay_to_f32)
+        return false;
+
+    int render_fmt = mp_repack_get_format_dst(cache->overlay_to_f32);
+
+    struct mp_regular_imgfmt ofdesc = {0};
+    mp_get_regular_imgfmt(&ofdesc, render_fmt);
+
+    if (odesc.planes[odesc.num_planes - 1].components[0] != 4)
+        return false;
+
+    // The formats must be the same, minus possible lack of alpha in vfdesc.
+    if (ofdesc.num_planes != vfdesc.num_planes &&
+        ofdesc.num_planes - 1 != vfdesc.num_planes)
+        return false;
+    for (int n = 0; n < vfdesc.num_planes; n++) {
+        if (vfdesc.planes[n].components[0] != ofdesc.planes[n].components[0])
+            return false;
+    }
+
+    cache->align_x = MPMAX(mp_repack_get_align_x(cache->overlay_to_f32),
+                           mp_repack_get_align_x(cache->video_to_f32));
+    cache->align_y = MPMAX(mp_repack_get_align_y(cache->overlay_to_f32),
+                           mp_repack_get_align_y(cache->video_to_f32));
+
+    assert(cache->align_x < TILE_W && cache->align_y < TILE_H);
+
+    int w = MP_ALIGN_UP(params->w, cache->align_x);
+    int h = MP_ALIGN_UP(params->h, cache->align_y);
+
+    cache->rgba_overlay = talloc_steal(cache, mp_image_alloc(IMGFMT_BGR32, w, h));
+    cache->video_overlay = talloc_steal(cache, mp_image_alloc(overlay_fmt, w, h));
+    cache->overlay_tmp = talloc_steal(cache,
+                            mp_image_alloc(render_fmt, w /*TILE_W*/, cache->align_y));
+    cache->video_tmp = talloc_steal(cache,
+                            mp_image_alloc(vid_f32_fmt, w /*TILE_W*/, cache->align_y));
+    if (!cache->rgba_overlay || !cache->video_overlay ||
+        !cache->overlay_tmp || !cache->video_tmp)
+        return false;
+
+    mp_image_params_guess_csp(&cache->rgba_overlay->params);
+    cache->rgba_overlay->params.alpha = MP_ALPHA_PREMUL;
+
+    cache->video_overlay->params.color = params->color;
+    cache->video_overlay->params.chroma_location = params->chroma_location;
+    cache->video_overlay->params.alpha = MP_ALPHA_PREMUL;
+
+    cache->overlay_tmp->params.color = params->color;
+    cache->video_tmp->params.color = params->color;
+
+    if (!repack_config_buffers(cache->overlay_to_f32, 0, cache->overlay_tmp,
+                               0, cache->video_overlay, NULL))
+        return false;
+
+    cache->rgba_to_overlay = mp_sws_alloc(cache);
+    cache->rgba_to_overlay->force_scaler = MP_SWS_ZIMG;
+    if (!mp_sws_supports_formats(cache->rgba_to_overlay,
+                    cache->video_overlay->imgfmt, cache->rgba_overlay->imgfmt))
+        return false;
+
+    cache->t_w = MP_ALIGN_UP(cache->video_overlay->w, TILE_W) / TILE_W;
+    cache->t_h = MP_ALIGN_UP(cache->video_overlay->h, TILE_H) / TILE_H;
+
+    cache->tiles = talloc_zero_array(cache, struct tile, cache->t_w * cache->t_h);
+
+    printf("ov_vid: %s\n", vo_format_name(cache->video_overlay->imgfmt));
+    printf("ov_f32: %s\n", vo_format_name(cache->overlay_tmp->imgfmt));
+    printf("vid_f32: %s\n", vo_format_name(cache->video_tmp->imgfmt));
+    printf("align=%d:%d\n", cache->align_x, cache->align_y);
+
+    // TODO: init extents
 
     return true;
-}
-
-// Convert the src image to imgfmt (which should be a 444 format)
-static struct mp_image *chroma_up(struct mp_draw_sub_cache *cache, int imgfmt,
-                                  struct mp_image *src)
-{
-    if (src->imgfmt == imgfmt)
-        return src;
-
-    if (!cache->upsample_img || cache->upsample_img->imgfmt != imgfmt ||
-        cache->upsample_img->w < src->w || cache->upsample_img->h < src->h)
-    {
-        talloc_free(cache->upsample_img);
-        cache->upsample_img = mp_image_alloc(imgfmt, src->w, src->h);
-        talloc_steal(cache, cache->upsample_img);
-        if (!cache->upsample_img)
-            return NULL;
-    }
-
-    cache->upsample_temp = *cache->upsample_img;
-    struct mp_image *temp = &cache->upsample_temp;
-    mp_image_set_size(temp, src->w, src->h);
-
-    // The temp image is always YUV, but src not necessarily.
-    // Reduce amount of conversions in YUV case (upsampling/shifting only)
-    if (src->fmt.flags & MP_IMGFLAG_YUV)
-        temp->params.color = src->params.color;
-
-    if (src->imgfmt == IMGFMT_420P) {
-        assert(imgfmt == IMGFMT_444P);
-        // Faster upsampling: keep Y plane, upsample chroma planes only
-        // The whole point is not having swscale copy the Y plane
-        struct mp_image t_dst = *temp;
-        mp_image_setfmt(&t_dst, IMGFMT_Y8);
-        mp_image_set_size(&t_dst, temp->w, temp->h);
-        struct mp_image t_src = t_dst;
-        mp_image_set_size(&t_src, src->w >> 1, src->h >> 1);
-        for (int c = 0; c < 2; c++) {
-            t_dst.planes[0] = temp->planes[1 + c];
-            t_dst.stride[0] = temp->stride[1 + c];
-            t_src.planes[0] = src->planes[1 + c];
-            t_src.stride[0] = src->stride[1 + c];
-            mp_image_swscale(&t_dst, &t_src, SWS_POINT);
-        }
-        temp->planes[0] = src->planes[0];
-        temp->stride[0] = src->stride[0];
-    } else {
-        mp_image_swscale(temp, src, SWS_POINT);
-    }
-
-    return temp;
-}
-
-// Undo chroma_up() (copy temp to old_src if needed)
-static void chroma_down(struct mp_image *old_src, struct mp_image *temp)
-{
-    assert(old_src->w == temp->w && old_src->h == temp->h);
-    if (temp != old_src) {
-        if (old_src->imgfmt == IMGFMT_420P) {
-            // Downsampling, skipping the Y plane (see chroma_up())
-            assert(temp->imgfmt == IMGFMT_444P);
-            assert(temp->planes[0] == old_src->planes[0]);
-            struct mp_image t_dst = *temp;
-            mp_image_setfmt(&t_dst, IMGFMT_Y8);
-            mp_image_set_size(&t_dst, old_src->w >> 1, old_src->h >> 1);
-            struct mp_image t_src = t_dst;
-            mp_image_set_size(&t_src, temp->w, temp->h);
-            for (int c = 0; c < 2; c++) {
-                t_dst.planes[0] = old_src->planes[1 + c];
-                t_dst.stride[0] = old_src->stride[1 + c];
-                t_src.planes[0] = temp->planes[1 + c];
-                t_src.stride[0] = temp->stride[1 + c];
-                mp_image_swscale(&t_dst, &t_src, SWS_AREA);
-            }
-        } else {
-            mp_image_swscale(old_src, temp, SWS_AREA); // chroma down
-        }
-    }
-}
-
-static void draw_sbs(struct mp_draw_sub_cache **cache, struct mp_image *dst,
-                     struct sub_bitmaps *sbs)
-{
-    assert(mp_draw_sub_formats[sbs->format]);
-    if (!mp_sws_supported_format(dst->imgfmt))
-        return;
-
-    struct mp_draw_sub_cache *cache_ = cache ? *cache : NULL;
-    if (!cache_)
-        cache_ = talloc_zero(NULL, struct mp_draw_sub_cache);
-
-    int format, bits;
-    get_closest_y444_format(dst->imgfmt, &format, &bits);
-
-    struct mp_rect rc_list[MP_SUB_BB_LIST_MAX];
-    int num_rc = mp_get_sub_bb_list(sbs, rc_list, MP_SUB_BB_LIST_MAX);
-
-    for (int r = 0; r < num_rc; r++) {
-        struct mp_rect bb = rc_list[r];
-
-        if (!align_bbox_for_swscale(dst, &bb))
-            return;
-
-        struct mp_image dst_region = *dst;
-        mp_image_crop_rc(&dst_region, bb);
-        struct mp_image *temp = chroma_up(cache_, format, &dst_region);
-        if (!temp)
-            continue; // on OOM, skip region
-
-        if (sbs->format == SUBBITMAP_RGBA) {
-            draw_rgba(cache_, bb, temp, bits, sbs);
-        } else if (sbs->format == SUBBITMAP_LIBASS) {
-            draw_ass(cache_, bb, temp, bits, sbs);
-        }
-
-        chroma_down(&dst_region, temp);
-    }
-
-    if (cache) {
-        *cache = cache_;
-    } else {
-        talloc_free(cache_);
-    }
 }
 
 // cache: if not NULL, the function will set *cache to a talloc-allocated cache
 //        containing scaled versions of sbs contents - free the cache with
 //        talloc_free()
-void mp_draw_sub_bitmaps(struct mp_draw_sub_cache **cache, struct mp_image *dst,
+void mp_draw_sub_bitmaps(struct mp_draw_sub_cache **p_cache, struct mp_image *dst,
                          struct sub_bitmap_list *sbs_list)
 {
+    struct mp_draw_sub_cache *cache = p_cache ? *p_cache : NULL;
+    if (!cache)
+        cache = talloc_zero(NULL, struct mp_draw_sub_cache);
+
+    if (!mp_image_params_equal(&cache->params, &dst->params) || !cache->video_tmp)
+    {
+        if (!reinit(cache, &dst->params)) {
+            talloc_free_children(cache);
+            *cache = (struct mp_draw_sub_cache){0};
+            goto done;
+        }
+    }
+
+    struct sub_bitmaps *parts[MAX_OSD_PARTS] = {0};
+    bool dirty = false;
+
     for (int n = 0; n < sbs_list->num_items; n++)
-        draw_sbs(cache, dst, sbs_list->items[n]);
+        parts[sbs_list->items[n]->render_index] = sbs_list->items[n];
+
+    for (int n = 0; n < MAX_OSD_PARTS; n++) {
+        struct sub_bitmaps *sb = parts[n];
+        int change_id = sb ? sb->change_id : 0;
+        dirty |= change_id != cache->parts[n].change_id;
+    }
+
+    if (dirty) {
+        clear_rgba_overlay(cache);
+
+        for (int n = 0; n < MAX_OSD_PARTS; n++) {
+            struct sub_bitmaps *sb = parts[n];
+            if (sb) {
+                render_sb(cache, sb);
+            } else {
+                cache->parts[n].change_id = 0;
+            }
+        }
+
+        convert_to_video_overlay(cache);
+    }
+
+    blend_overlay_with_video(cache, dst);
+
+done:
+    if (p_cache) {
+        *p_cache = cache;
+    } else {
+        talloc_free(cache);
+    }
 }
 
 // vim: ts=4 sw=4 et tw=80
