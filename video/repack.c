@@ -987,6 +987,7 @@ static bool setup_format_ne(struct mp_repack *rp)
         struct mp_regular_imgfmt fdesc = desc;
         fdesc.component_type = MP_COMPONENT_TYPE_FLOAT;
         fdesc.component_size = 4;
+        fdesc.component_pad = 0;
         int ffmt = mp_find_regular_imgfmt(&fdesc);
         if (!ffmt)
             return false;

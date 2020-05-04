@@ -142,6 +142,9 @@ static void blend_overlay_with_video(struct mp_draw_sub_cache *cache,
 
 static void convert_to_video_overlay(struct mp_draw_sub_cache *cache)
 {
+    if (!cache->video_overlay)
+        return;
+
     // TODO: use tile shit to avoid converting some parts of the overlay
     if (mp_sws_scale(cache->rgba_to_overlay, cache->video_overlay,
                      cache->rgba_overlay) < 0)
@@ -255,31 +258,38 @@ static bool reinit(struct mp_draw_sub_cache *cache, struct mp_image_params *para
     assert(vfdesc.component_type == MP_COMPONENT_TYPE_FLOAT);
     struct mp_regular_imgfmt odesc = vfdesc;
 
-    // Try to use video component type to reduce problems with value ranges.
-    // The low bit depth ones typically don't have alpha variants either.
-    struct mp_regular_imgfmt vdesc = {0};
-    int vdepth = 0;
-    if (mp_get_regular_imgfmt(&vdesc, params->imgfmt))
-        vdepth = vdesc.component_size * 8 + MPMIN(vdesc.component_pad, 0);
-    if (vdepth >= 8) {
-        odesc.component_type = vdesc.component_type;
-        odesc.component_size = vdesc.component_size;
-        odesc.component_pad = MPMIN(vdesc.component_pad, 0);
+    int overlay_fmt = 0;
+    if (params->color.space == MP_CSP_RGB) {
+        // No point in doing anything fancy.
+        // TODO: check for more corner cases (different gamma/primaries?)
+        overlay_fmt = IMGFMT_BGR32;
     } else {
-        odesc.component_type = MP_COMPONENT_TYPE_UINT;
-        odesc.component_size = 1;
-        odesc.component_pad = 0;
-    }
+        // Try to use video component type to reduce problems with value ranges.
+        // The low bit depth ones typically don't have alpha variants either.
+        struct mp_regular_imgfmt vdesc = {0};
+        int vdepth = 0;
+        if (mp_get_regular_imgfmt(&vdesc, params->imgfmt))
+            vdepth = vdesc.component_size * 8 + MPMIN(vdesc.component_pad, 0);
+        if (vdepth >= 8) {
+            odesc.component_type = vdesc.component_type;
+            odesc.component_size = vdesc.component_size;
+            odesc.component_pad = MPMIN(vdesc.component_pad, 0);
+        } else {
+            odesc.component_type = MP_COMPONENT_TYPE_UINT;
+            odesc.component_size = 1;
+            odesc.component_pad = 0;
+        }
 
-    // Ensure there's alpha.
-    if (odesc.planes[odesc.num_planes - 1].components[0] != 4) {
-        if (odesc.num_planes >= 4)
-            return false; // wat
-        odesc.planes[odesc.num_planes++] =
-            (struct mp_regular_imgfmt_plane){1, {4}};
-    }
+        // Ensure there's alpha.
+        if (odesc.planes[odesc.num_planes - 1].components[0] != 4) {
+            if (odesc.num_planes >= 4)
+                return false; // wat
+            odesc.planes[odesc.num_planes++] =
+                (struct mp_regular_imgfmt_plane){1, {4}};
+        }
 
-    int overlay_fmt = mp_find_regular_imgfmt(&odesc);
+        overlay_fmt = mp_find_regular_imgfmt(&odesc);
+    }
     if (!overlay_fmt)
         return false;
 
@@ -293,7 +303,7 @@ static bool reinit(struct mp_draw_sub_cache *cache, struct mp_image_params *para
     struct mp_regular_imgfmt ofdesc = {0};
     mp_get_regular_imgfmt(&ofdesc, render_fmt);
 
-    if (odesc.planes[odesc.num_planes - 1].components[0] != 4)
+    if (ofdesc.planes[ofdesc.num_planes - 1].components[0] != 4)
         return false;
 
     // The formats must be the same, minus possible lack of alpha in vfdesc.
@@ -316,41 +326,50 @@ static bool reinit(struct mp_draw_sub_cache *cache, struct mp_image_params *para
     int h = MP_ALIGN_UP(params->h, cache->align_y);
 
     cache->rgba_overlay = talloc_steal(cache, mp_image_alloc(IMGFMT_BGR32, w, h));
-    cache->video_overlay = talloc_steal(cache, mp_image_alloc(overlay_fmt, w, h));
     cache->overlay_tmp = talloc_steal(cache,
                             mp_image_alloc(render_fmt, w /*TILE_W*/, cache->align_y));
     cache->video_tmp = talloc_steal(cache,
                             mp_image_alloc(vid_f32_fmt, w /*TILE_W*/, cache->align_y));
-    if (!cache->rgba_overlay || !cache->video_overlay ||
-        !cache->overlay_tmp || !cache->video_tmp)
+    if (!cache->rgba_overlay || !cache->overlay_tmp || !cache->video_tmp)
         return false;
 
     mp_image_params_guess_csp(&cache->rgba_overlay->params);
     cache->rgba_overlay->params.alpha = MP_ALPHA_PREMUL;
 
-    cache->video_overlay->params.color = params->color;
-    cache->video_overlay->params.chroma_location = params->chroma_location;
-    cache->video_overlay->params.alpha = MP_ALPHA_PREMUL;
-
     cache->overlay_tmp->params.color = params->color;
     cache->video_tmp->params.color = params->color;
 
-    if (!repack_config_buffers(cache->overlay_to_f32, 0, cache->overlay_tmp,
-                               0, cache->video_overlay, NULL))
+    if (cache->rgba_overlay->imgfmt == overlay_fmt) {
+        if (!repack_config_buffers(cache->overlay_to_f32, 0, cache->overlay_tmp,
+                                   0, cache->rgba_overlay, NULL))
         return false;
+    } else {
+        cache->video_overlay = talloc_steal(cache,
+                                            mp_image_alloc(overlay_fmt, w, h));
+        if (!cache->video_overlay)
+            return false;
 
-    cache->rgba_to_overlay = mp_sws_alloc(cache);
-    cache->rgba_to_overlay->force_scaler = MP_SWS_ZIMG;
-    if (!mp_sws_supports_formats(cache->rgba_to_overlay,
+        cache->video_overlay->params.color = params->color;
+        cache->video_overlay->params.chroma_location = params->chroma_location;
+        cache->video_overlay->params.alpha = MP_ALPHA_PREMUL;
+
+        cache->rgba_to_overlay = mp_sws_alloc(cache);
+        cache->rgba_to_overlay->force_scaler = MP_SWS_ZIMG;
+        if (!mp_sws_supports_formats(cache->rgba_to_overlay,
                     cache->video_overlay->imgfmt, cache->rgba_overlay->imgfmt))
-        return false;
+            return false;
 
-    cache->t_w = MP_ALIGN_UP(cache->video_overlay->w, TILE_W) / TILE_W;
-    cache->t_h = MP_ALIGN_UP(cache->video_overlay->h, TILE_H) / TILE_H;
+        if (!repack_config_buffers(cache->overlay_to_f32, 0, cache->overlay_tmp,
+                                   0, cache->video_overlay, NULL))
+            return false;
+    }
+
+    cache->t_w = MP_ALIGN_UP(cache->rgba_overlay->w, TILE_W) / TILE_W;
+    cache->t_h = MP_ALIGN_UP(cache->rgba_overlay->h, TILE_H) / TILE_H;
 
     cache->tiles = talloc_zero_array(cache, struct tile, cache->t_w * cache->t_h);
 
-    printf("ov_vid: %s\n", vo_format_name(cache->video_overlay->imgfmt));
+    printf("ov_vid: %s\n", vo_format_name(cache->video_overlay ? cache->video_overlay->imgfmt : 0));
     printf("ov_f32: %s\n", vo_format_name(cache->overlay_tmp->imgfmt));
     printf("vid_f32: %s\n", vo_format_name(cache->video_tmp->imgfmt));
     printf("align=%d:%d\n", cache->align_x, cache->align_y);
@@ -375,6 +394,7 @@ void mp_draw_sub_bitmaps(struct mp_draw_sub_cache **p_cache, struct mp_image *ds
         if (!reinit(cache, &dst->params)) {
             talloc_free_children(cache);
             *cache = (struct mp_draw_sub_cache){0};
+            printf("failed\n");
             goto done;
         }
     }

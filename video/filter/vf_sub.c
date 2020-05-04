@@ -79,8 +79,8 @@ static void vf_sub_process(struct mp_filter *f)
 
     struct mp_image *mpi = frame.data;
 
-    if (!mp_sws_supported_format(mpi->imgfmt))
-        goto error;
+    //if (!mp_sws_supported_format(mpi->imgfmt))
+    //    goto error;
 
     struct mp_osd_res dim = {
         .w = mpi->w,
